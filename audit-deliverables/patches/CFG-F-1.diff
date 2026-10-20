@@ -1,0 +1,11 @@
+--- a/src/os/unix/ngx_control.c
++++ b/src/os/unix/ngx_control.c
+@@ -95,7 +95,7 @@
+ #ifdef NGX_BUILD
+ static ngx_str_t  ngx_control_build = ngx_string(NGX_BUILD);
+ #else
+-static ngx_str_t  ngx_control_build;
++static ngx_str_t  ngx_control_build = ngx_string("");
+ #endif
+ 
+ static ngx_data_decl_t  ngx_control_process_fields[] = {

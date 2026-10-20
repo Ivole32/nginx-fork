@@ -1,0 +1,204 @@
+--- a/src/os/unix/ngx_control.c
++++ b/src/os/unix/ngx_control.c
+@@ -24,6 +24,9 @@
+ 
+ #define NGX_CTRL_ENV             "NGINX_CTRL"
+ 
++/* "unix uid:N gid:N pid:N" or a socket address with port */
++#define NGX_CTRL_PEER_LEN        (NGX_SOCKADDR_STRLEN + 64)
++
+ 
+ typedef struct {
+     ngx_fd_t      fd;
+@@ -38,6 +41,9 @@
+     ngx_chain_t  *out;
+ 
+     ngx_uint_t    reloaded;
++
++    u_char        peer[NGX_CTRL_PEER_LEN];
++    size_t        peer_len;
+ } ngx_control_request_t;
+ 
+ 
+@@ -51,6 +57,9 @@
+ static ngx_int_t ngx_control_inherit(void);
+ static void ngx_control_close(ngx_control_request_t *r);
+ static void ngx_control_handle_accept(void);
++static ngx_uint_t ngx_control_loopback(struct sockaddr *sa);
++static void ngx_control_set_peer(ngx_control_request_t *r,
++    struct sockaddr *sa, socklen_t socklen);
+ static ngx_int_t ngx_control_handle_read(ngx_control_request_t *r);
+ static ngx_int_t ngx_control_content(ngx_control_request_t *r);
+ static char *ngx_control_status_text(ngx_uint_t code);
+@@ -187,6 +196,12 @@
+     }
+ #endif
+ 
++    if (!ngx_control_loopback(&u.sockaddr.sockaddr)) {
++        ngx_log_error(NGX_LOG_WARN, ngx_cycle->log, 0,
++                      "control: listening on non-loopback address \"%V\" "
++                      "without authentication", &u.url);
++    }
++
+     if (ngx_control_inherit() == NGX_OK) {
+         ngx_control_inherited = 1;
+         return NGX_OK;
+@@ -457,17 +472,90 @@
+ }
+ 
+ 
++static ngx_uint_t
++ngx_control_loopback(struct sockaddr *sa)
++{
++    switch (sa->sa_family) {
++
++    case AF_INET:
++        return (ntohl(((struct sockaddr_in *) sa)->sin_addr.s_addr) >> 24)
++               == 0x7f;
++
++#if (NGX_HAVE_INET6)
++    case AF_INET6:
++        return IN6_IS_ADDR_LOOPBACK(&((struct sockaddr_in6 *) sa)->sin6_addr);
++#endif
++
++#if (NGX_HAVE_UNIX_DOMAIN)
++    case AF_UNIX:
++        return 1;
++#endif
++
++    default:
++        return 0;
++    }
++}
++
++
++static void
++ngx_control_set_peer(ngx_control_request_t *r, struct sockaddr *sa,
++    socklen_t socklen)
++{
++    u_char  *p, *last;
++
++    p = r->peer;
++    last = p + NGX_CTRL_PEER_LEN;
++
++#if (NGX_HAVE_UNIX_DOMAIN)
++    if (sa->sa_family == AF_UNIX) {
++
++#ifdef SO_PEERCRED
++        struct ucred  cred;
++        socklen_t     len;
++
++        len = sizeof(struct ucred);
++
++        if (getsockopt(r->fd, SOL_SOCKET, SO_PEERCRED, &cred, &len) == 0) {
++            p = ngx_slprintf(p, last, "unix uid:%ui gid:%ui pid:%P",
++                             (ngx_uint_t) cred.uid, (ngx_uint_t) cred.gid,
++                             (ngx_pid_t) cred.pid);
++            r->peer_len = p - r->peer;
++            return;
++        }
++
++        ngx_log_error(NGX_LOG_ALERT, ngx_cycle->log, ngx_socket_errno,
++                      "control: getsockopt(SO_PEERCRED) failed");
++#endif
++
++        p = ngx_cpymem(p, "unix", sizeof("unix") - 1);
++        r->peer_len = p - r->peer;
++        return;
++    }
++#endif
++
++    r->peer_len = ngx_sock_ntop(sa, socklen, p, NGX_CTRL_PEER_LEN, 1);
++
++    if (r->peer_len == 0) {
++        p = ngx_cpymem(p, "-", 1);
++        r->peer_len = p - r->peer;
++    }
++}
++
++
+ static void
+ ngx_control_handle_accept(void)
+ {
+     int                     value;
+     ngx_fd_t                fd;
+     ngx_err_t               err;
++    socklen_t               socklen;
+     struct pollfd          *pfd;
++    ngx_sockaddr_t          sa;
+     ngx_control_request_t  *r;
+ 
+     for ( ;; ) {
+-        fd = accept(ngx_control_pollfd[0].fd, NULL, NULL);
++        socklen = sizeof(ngx_sockaddr_t);
++        fd = accept(ngx_control_pollfd[0].fd, &sa.sockaddr, &socklen);
+ 
+         if (fd == -1) {
+             err = ngx_socket_errno;
+@@ -499,6 +587,8 @@
+         ngx_memzero(r, sizeof(ngx_control_request_t));
+         r->fd = fd;
+ 
++        ngx_control_set_peer(r, &sa.sockaddr, socklen);
++
+         ngx_log_debug1(NGX_LOG_DEBUG_EVENT, ngx_cycle->log, 0,
+                        "control accept fd:%d", r->fd);
+ 
+@@ -731,9 +821,12 @@
+     ngx_buf_t *body)
+ {
+     char         *status;
++    ngx_str_t     path;
+     ngx_uint_t    n;
+     ngx_chain_t  *c;
+ 
++    static const char  *methods[] = { "-", "GET", "PATCH" };
++
+     const char  response_fmt[] =
+         "HTTP/1.1 %03ui %s\r\n"
+         "Server: " NGINX_VER "\r\n"
+@@ -742,6 +835,18 @@
+         "Content-Length: %ui\r\n"
+         "\r\n";
+ 
++    if (r->path.len) {
++        path = r->path;
++
++    } else {
++        ngx_str_set(&path, "-");
++    }
++
++    ngx_log_error(NGX_LOG_NOTICE, ngx_cycle->log, 0,
++                  "control: client %*s, \"%s %V\" %ui",
++                  r->peer_len, r->peer,
++                  r->method < 3 ? methods[r->method] : "-", &path, code);
++
+     c = ngx_alloc_chain_link(r->pool);
+     if (c == NULL) {
+         return NGX_ERROR;
+--- a/docs/man/nginx.8
++++ b/docs/man/nginx.8
+@@ -192,6 +192,23 @@
+ .Bd -literal -offset indent
+ nginx -c ~/mynginx.conf -l unix:/path/to/socket
+ .Ed
++.Pp
++The control socket is not authenticated:
++every process that is able to connect to it can read the complete
++configuration, including all included files, and request a reload.
++Use a UNIX-domain socket, which is created with mode 0600 and is
++owned by the user that started
++.Nm
++(usually root), or a loopback address on a host where every local
++account is trusted.
++A non-loopback address exposes the control socket to the network
++and must be protected by host firewalling;
++.Nm
++logs a warning when it is used.
++Every control request is logged to the error log at the
++.Dq notice
++level together with the client address or, for UNIX-domain sockets,
++the credentials of the connecting process.
+ .Sh ENVIRONMENT
+ The
+ .Ev NGINX

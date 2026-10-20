@@ -1,0 +1,72 @@
+--- a/src/http/modules/ngx_http_tunnel_module.c
++++ b/src/http/modules/ngx_http_tunnel_module.c
+@@ -33,6 +33,8 @@
+ 
+ static char *ngx_http_tunnel_pass(ngx_conf_t *cf, ngx_command_t *cmd,
+     void *conf);
++static void ngx_http_tunnel_check_location(ngx_conf_t *cf,
++    ngx_http_core_loc_conf_t *clcf);
+ 
+ static char *ngx_http_tunnel_lowat_check(ngx_conf_t *cf, void *post, void *data);
+ 
+@@ -458,6 +460,8 @@
+ 
+     clcf = ngx_http_conf_get_module_loc_conf(cf, ngx_http_core_module);
+ 
++    ngx_http_tunnel_check_location(cf, clcf);
++
+     clcf->handler = ngx_http_tunnel_handler;
+ 
+     cscf = ngx_http_conf_get_module_srv_conf(cf, ngx_http_core_module);
+@@ -508,6 +512,51 @@
+ }
+ 
+ 
++/*
++ * A CONNECT request always carries the URI "/" (ngx_http_parse_request_line()
++ * pins uri_start/uri_end to the "/" of "HTTP/1.1"), so it can only be routed
++ * to a location that matches "/": the server level, a prefix or exact
++ * location "/", an "if" or "limit_except" block inside one of those (they
++ * inherit the parent's name), a regular expression location matching "/",
++ * or a named location reached through an internal redirect.  A "tunnel_pass"
++ * anywhere else is dead for CONNECT, while "allow_connect" is still enabled
++ * server-wide and CONNECT requests are handled by whatever serves "/".
++ */
++
++static void
++ngx_http_tunnel_check_location(ngx_conf_t *cf, ngx_http_core_loc_conf_t *clcf)
++{
++#if (NGX_PCRE)
++    ngx_int_t  rc;
++    ngx_str_t  slash = ngx_string("/");
++#endif
++
++    if (clcf->name.len == 0 || clcf->named || clcf->predicate) {
++        return;
++    }
++
++#if (NGX_PCRE)
++    if (clcf->regex) {
++        rc = ngx_regex_exec(clcf->regex->regex, &slash, NULL, 0);
++
++        if (rc != NGX_REGEX_NO_MATCHED) {
++            return;
++        }
++
++    } else
++#endif
++    if (clcf->name.len == 1 && clcf->name.data[0] == '/') {
++        return;
++    }
++
++    ngx_conf_log_error(NGX_LOG_WARN, cf, 0,
++                       "\"tunnel_pass\" in location \"%V\" cannot be reached "
++                       "by CONNECT requests, which always have URI \"/\" "
++                       "and are routed to the location matching \"/\"",
++                       &clcf->name);
++}
++
++
+ static char *
+ ngx_http_tunnel_lowat_check(ngx_conf_t *cf, void *post, void *data)
+ {

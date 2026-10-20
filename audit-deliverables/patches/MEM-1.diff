@@ -1,0 +1,65 @@
+--- a/src/core/ngx_json_parse.h
++++ b/src/core/ngx_json_parse.h
+@@ -95,6 +95,7 @@
+     ngx_uint_t             hex_left;         /* hex digits still expected */
+ 
+     ngx_uint_t             skip_until_depth;
++    ngx_uint_t             skip_close;       /* unsigned skip_close:1; */
+ 
+     ngx_pool_t            *pool;
+     ngx_json_handler_pt    handler;
+--- a/src/core/ngx_json_parse.c
++++ b/src/core/ngx_json_parse.c
+@@ -45,6 +45,7 @@
+ 
+     ctx->depth = 0;
+     ctx->skip_until_depth = NGX_JSON_NOT_SKIPPING;
++    ctx->skip_close = 0;
+     ctx->max_depth = NGX_JSON_DEFAULT_MAX_DEPTH;
+ 
+     /* stack is allocated lazily on first push, sized to max_depth */
+@@ -748,6 +749,7 @@
+         case NGX_JSON_OBJECT_OPEN:
+         case NGX_JSON_ARRAY_OPEN:
+             ctx->skip_until_depth = ctx->depth;
++            ctx->skip_close = 0;
+             break;
+ 
+         case NGX_JSON_VALUE_STRING:
+@@ -758,7 +760,13 @@
+             if (ctx->depth > 0
+                 && ctx->stack[ctx->depth - 1] == ngx_json_ctx_array
+             ) {
++                /*
++                 * the consumer has already seen this array's OPEN, so
++                 * the skip must end at its ']' and the CLOSE be delivered
++                 */
++
+                 ctx->skip_until_depth = ctx->depth - 1;
++                ctx->skip_close = 1;
+             }
+             break;
+ 
+@@ -796,6 +804,22 @@
+ 
+     ctx->depth--;
+ 
++    /*
++     * A skip started on a scalar array element ends at the array's own
++     * ']' (skip_until_depth is the array's depth): the consumer saw the
++     * ARRAY_OPEN, so stop skipping before the CLOSE is emitted.  A skip
++     * started on OPEN or KEY keeps suppressing the CLOSE of the container
++     * it covers, since that container's OPEN was never delivered.
++     */
++
++    if (ctx->skip_close
++        && ngx_json_skipping(ctx->skip_until_depth)
++        && ctx->depth <= ctx->skip_until_depth)
++    {
++        ctx->skip_until_depth = NGX_JSON_NOT_SKIPPING;
++        ctx->skip_close = 0;
++    }
++
+     rc = ngx_json_emit(ctx, event, p, 1);
+     if (rc != NGX_OK) {
+         return rc;

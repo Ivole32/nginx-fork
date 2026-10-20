@@ -1,0 +1,37 @@
+--- a/src/http/ngx_http_request.c	2026-10-20 21:38:50.332444665 +0000
++++ b/src/http/ngx_http_request.c	2026-10-20 22:07:28.128546776 +0000
+@@ -2535,6 +2535,34 @@
+             ngx_http_finalize_request(r, NGX_HTTP_MISDIRECTED_REQUEST);
+             return NGX_ERROR;
+         }
++
++    } else if (hc->ssl && rc == NGX_OK && cscf->ctx != hc->conf_ctx) {
++
++        /*
++         * The client did not use TLS SNI (or used an SNI that matched no
++         * virtual server), so the handshake - including the client
++         * certificate request, the trusted CA list and the verification
++         * result - was performed under hc->conf_ctx (the listen's default
++         * server).  The Host header has now routed the request to a
++         * different virtual server.  If that server enforces client
++         * certificate verification, its policy was never applied during
++         * the handshake, so reject the request the same way a mismatching
++         * SNI is rejected, instead of admitting it on the default server's
++         * verification result.
++         */
++
++        ngx_http_ssl_srv_conf_t  *sscf;
++
++        sscf = ngx_http_get_module_srv_conf(cscf->ctx, ngx_http_ssl_module);
++
++        if (sscf->verify) {
++            ngx_log_error(NGX_LOG_INFO, r->connection->log, 0,
++                          "client attempted to request the server name "
++                          "different from the one that was negotiated "
++                          "without using TLS SNI");
++            ngx_http_finalize_request(r, NGX_HTTP_MISDIRECTED_REQUEST);
++            return NGX_ERROR;
++        }
+     }
+ 
+ #endif
